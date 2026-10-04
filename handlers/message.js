@@ -1,10 +1,12 @@
 // Get Emoji ID bot — Telegram Serverless handler.
 // Send a premium (custom) emoji, a text with several, or a sticker.
-// Bot replies with custom_emoji_id + ready-to-use HTML / MarkdownV2 snippets.
+// Bot replies with the custom_emoji_id, copy-ready code blocks and copy buttons.
 
 import { api } from 'sdk';
 
-const MAX_LEN = 3800; // stay under Telegram's 4096 char message limit
+const MAX_LEN = 3800;      // under Telegram's 4096 char limit
+const MAX_COPY = 256;      // copy_text button limit
+const MAX_BTN_ROWS = 8;    // keep keyboard compact
 
 const esc = (s) =>
   String(s ?? '')
@@ -12,8 +14,10 @@ const esc = (s) =>
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 
-// Collect unique custom emoji IDs from text, caption and stickers.
-// Returns Map<id, fallbackEmoji>.
+const htmlSnippet = (id, f) => `<tg-emoji emoji-id="${id}">${f}</tg-emoji>`;
+const mdSnippet = (id, f) => `![${f}](tg://emoji?id=${id})`;
+
+// Collect unique custom emoji IDs. Returns Map<id, fallbackEmoji>.
 function collectEmojis(message) {
   const found = new Map();
 
@@ -39,32 +43,65 @@ function collectEmojis(message) {
   return found;
 }
 
-function emojiBlock(index, id, fallback) {
-  const f = esc(fallback);
+function emojiBlock(index, total, id, fallback) {
+  const title =
+    total > 1
+      ? `<b>${index}</b> ┃ ${esc(fallback)}`
+      : `${esc(fallback)}  <b>Premium Emoji</b>`;
+
   return [
-    `<b>${index}.</b> ${f}`,
-    `ID: <code>${id}</code>`,
-    `HTML: <code>&lt;tg-emoji emoji-id="${id}"&gt;${f}&lt;/tg-emoji&gt;</code>`,
-    `MarkdownV2: <code>![${f}](tg://emoji?id=${id})</code>`,
+    title,
+    `🆔 <code>${id}</code>`,
+    `<pre><code class="language-HTML">${esc(htmlSnippet(id, fallback))}</code></pre>`,
+    `<pre><code class="language-Markdown">${esc(mdSnippet(id, fallback))}</code></pre>`,
   ].join('\n');
 }
 
 function stickerBlock(st) {
-  const lines = ['<b>Sticker info:</b>'];
-  if (st.emoji) lines.push(`Emoji: ${esc(st.emoji)}`);
-  lines.push(`Type: <code>${esc(st.type)}</code>`);
-  if (st.set_name) lines.push(`Set: <code>${esc(st.set_name)}</code>`);
-  lines.push(`File ID: <code>${esc(st.file_id)}</code>`);
-  lines.push(`Unique ID: <code>${esc(st.file_unique_id)}</code>`);
-  return lines.join('\n');
+  const rows = [`🎴 <b>Sticker</b>  ${esc(st.emoji || '')}`, ''];
+  rows.push(`<b>Type</b> · <code>${esc(st.type)}</code>`);
+  if (st.set_name) rows.push(`<b>Pack</b> · <code>${esc(st.set_name)}</code>`);
+  rows.push('');
+  rows.push(`<pre><code class="language-file_id">${esc(st.file_id)}</code></pre>`);
+  return rows.join('\n');
+}
+
+// Copy buttons: per emoji (ID / HTML / MD), plus "copy all IDs" when several.
+function buildKeyboard(emojis) {
+  const rows = [];
+  const list = [...emojis.entries()];
+  const btn = (text, copy) =>
+    copy.length <= MAX_COPY ? { text, copy_text: { text: copy } } : null;
+
+  if (list.length === 1) {
+    const [id, f] = list[0];
+    rows.push(
+      [btn('📋 ID', id), btn('📋 HTML', htmlSnippet(id, f)), btn('📋 MD', mdSnippet(id, f))]
+        .filter(Boolean)
+    );
+  } else {
+    for (const [n, [id, f]] of list.slice(0, MAX_BTN_ROWS).entries()) {
+      rows.push(
+        [btn(`${n + 1} · ID`, id), btn('HTML', htmlSnippet(id, f)), btn('MD', mdSnippet(id, f))]
+          .filter(Boolean)
+      );
+    }
+    const all = list.map(([id]) => id).join(',');
+    const allBtn = btn('📋 Copy all IDs', all);
+    if (allBtn) rows.push([allBtn]);
+  }
+
+  const clean = rows.filter((r) => r.length);
+  return clean.length ? { inline_keyboard: clean } : undefined;
 }
 
 // Split blocks into messages that fit Telegram's limit.
 function pack(header, blocks) {
+  const sep = '\n\n';
   const out = [];
   let cur = header;
   for (const b of blocks) {
-    const next = cur ? `${cur}\n\n${b}` : b;
+    const next = cur ? `${cur}${sep}${b}` : b;
     if (next.length > MAX_LEN && cur) {
       out.push(cur);
       cur = b;
@@ -76,8 +113,8 @@ function pack(header, blocks) {
   return out;
 }
 
-async function reply(message, html) {
-  await api.sendMessage({
+async function reply(message, html, keyboard) {
+  const params = {
     chat_id: message.chat.id,
     text: html,
     parse_mode: 'HTML',
@@ -86,16 +123,26 @@ async function reply(message, html) {
       message_id: message.message_id,
       allow_sending_without_reply: true,
     },
-  });
+  };
+  if (keyboard) params.reply_markup = keyboard;
+  await api.sendMessage(params);
 }
 
 const START_TEXT = [
-  '👋 <b>Get Emoji ID</b>',
+  '✨ <b>Get Emoji ID</b>',
   '',
-  'Send me any <b>premium / custom emoji</b> (one or many in a message).',
-  'I reply with its ID and ready-to-paste code for bots.',
+  '<blockquote>Send any <b>premium emoji</b> — one or many.\nGet its ID and copy-ready code for your bots.</blockquote>',
   '',
-  'Also works with stickers (shows file_id and set name).',
+  '<b>Supports</b>',
+  '› Premium / custom emoji',
+  '› Several emoji in one message',
+  '› Stickers (file_id + pack name)',
+].join('\n');
+
+const EMPTY_TEXT = [
+  '⚠️ <b>No premium emoji found</b>',
+  '',
+  '<blockquote>Send a custom (premium) emoji or a sticker.</blockquote>',
 ].join('\n');
 
 export default async function (message) {
@@ -110,30 +157,29 @@ export default async function (message) {
   }
 
   const emojis = collectEmojis(message);
+  const total = emojis.size;
   const blocks = [];
   let i = 1;
   for (const [id, fallback] of emojis) {
-    blocks.push(emojiBlock(i++, id, fallback));
+    blocks.push(emojiBlock(i++, total, id, fallback));
   }
 
-  // Regular (non-custom-emoji) sticker: show sticker info.
+  // Regular (non-custom-emoji) sticker.
   if (message.sticker && !message.sticker.custom_emoji_id) {
     blocks.push(stickerBlock(message.sticker));
   }
 
   if (blocks.length === 0) {
-    await reply(
-      message,
-      '❌ No premium emoji found.\nSend a custom (premium) emoji or a sticker.'
-    );
+    await reply(message, EMPTY_TEXT);
     return;
   }
 
-  const header = emojis.size
-    ? `✅ <b>Found ${emojis.size} emoji ID${emojis.size > 1 ? 's' : ''}:</b>`
-    : '';
+  const header = total > 1 ? `✨ <b>${total} Premium Emoji</b>` : '';
+  const parts = pack(header, blocks);
+  const keyboard = total ? buildKeyboard(emojis) : undefined;
 
-  for (const part of pack(header, blocks)) {
-    await reply(message, part);
+  for (let p = 0; p < parts.length; p++) {
+    // Buttons only on the last message.
+    await reply(message, parts[p], p === parts.length - 1 ? keyboard : undefined);
   }
 }
